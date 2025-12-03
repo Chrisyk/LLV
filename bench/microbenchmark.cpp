@@ -19,15 +19,14 @@
 using namespace std::chrono_literals;
 
 struct BenchConfig {
-    int num_threads = 1;
+    int num_threads = 8;
     int duration_seconds = 5;
 
     int hot_keys = 100;
     int key_space = 1000000;
-    double hot_ratio = 0.1;
     double write_ratio = 0.2;
-    int reads_per_tx = 0;
-    int writes_per_tx = 10;
+    int reads_per_tx = 9;
+    int writes_per_tx = 1;
     int work_us = 160;
 };
 
@@ -59,20 +58,9 @@ static TxSets gen_tx_sets(const BenchConfig& cfg, URNG& rng) {
             out.reads.push_back(key_name(cold_dist(rng)));
         }
     } else {
-
-        std::uniform_real_distribution<double> unif(0.0, 1.0);
-        int hot_limit = static_cast<int>(cfg.key_space * cfg.hot_ratio);
-        hot_limit = std::max(hot_limit, 0);
-        std::uniform_int_distribution<int> hot_idx(0, std::max(0, hot_limit - 1));
-        std::uniform_int_distribution<int> cold_idx(std::max(0, hot_limit), std::max(0, cfg.key_space - 1));
-        for (int i = 0; i < cfg.reads_per_tx; ++i) {
-            int idx = (unif(rng) < cfg.hot_ratio && hot_limit > 0) ? hot_idx(rng) : cold_idx(rng);
-            out.reads.push_back(key_name(idx));
-        }
-        for (int i = 0; i < cfg.writes_per_tx; ++i) {
-            int idx = (unif(rng) < cfg.hot_ratio && hot_limit > 0) ? hot_idx(rng) : cold_idx(rng);
-            out.writes.push_back(key_name(idx));
-        }
+        std::uniform_int_distribution<int64_t> full_dist(0, std::max(0, cfg.key_space - 1));
+        for (int i = 0; i < cfg.writes_per_tx; ++i) out.writes.push_back(key_name(full_dist(rng)));
+        for (int i = 0; i < cfg.reads_per_tx; ++i) out.reads.push_back(key_name(full_dist(rng)));
     }
 
     auto dedup = [](std::vector<std::string>& v){
