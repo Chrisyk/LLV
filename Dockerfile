@@ -6,9 +6,7 @@ COPY . .
 
 RUN apt-get update && apt-get install -y cmake
 
-RUN rm -rf CMakeCache.txt CMakeFiles
-
-RUN cmake . && make
+RUN mkdir build && cd build && cmake .. && make
 
 # Run the microbenchmark by default
-CMD ["./bench_microbenchmark"]
+CMD ["./build/bench_microbenchmark"]

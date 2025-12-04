@@ -19,15 +19,14 @@
 using namespace std::chrono_literals;
 
 struct BenchConfig {
-    int num_threads = 8;
+    int num_threads = 1;
     int duration_seconds = 5;
 
-    int hot_keys = 100;
-    int key_space = 1000000;
-    double write_ratio = 0.2;
-    int reads_per_tx = 9;
-    int writes_per_tx = 1;
-    int work_us = 160;
+    int hot_keys = 100;         // Number of hot keys (Contention Index = 1 / hot_keys)
+    int key_space = 1000000;    // Total number of keys in the database
+    int reads_per_tx = 0;       // Number of reads per transaction
+    int writes_per_tx = 10;      // Number of writes per transaction
+    int work_us = 160;          // How long in microseconds each transaction "works"
 };
 
 static std::string key_name(int64_t idx) { return "k" + std::to_string(idx); }
@@ -43,7 +42,7 @@ static TxSets gen_tx_sets(const BenchConfig& cfg, URNG& rng) {
 
     if (cfg.hot_keys > 0) {
 
-        std::uniform_int_distribution<int> hot_dist(0, std::max(0, cfg.hot_keys - 1));
+        std::uniform_int_distribution<int> hot_dist(0, cfg.hot_keys - 1);
         int64_t hot_k = hot_dist(rng);
         out.writes.push_back(key_name(hot_k));
 
@@ -239,7 +238,48 @@ long run_vll(const BenchConfig& cfg) {
 
 int main(int argc, char** argv) {
     BenchConfig cfg;
-    std::cout << "Running microbenchmark: num_threads=" << cfg.num_threads << " duration=" << cfg.duration_seconds << "s\n";
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg.rfind("--", 0) == 0) {
+            std::string key = arg.substr(2);
+            std::string val;
+            size_t eq_pos = key.find('=');
+            if (eq_pos != std::string::npos) {
+                val = key.substr(eq_pos + 1);
+                key = key.substr(0, eq_pos);
+            }
+
+            if (key == "num_threads") {
+                cfg.num_threads = std::stoi(val);
+            } else if (key == "duration_seconds") {
+                cfg.duration_seconds = std::stoi(val);
+            } else if (key == "hot_keys") {
+                cfg.hot_keys = std::stoi(val);
+            } else if (key == "key_space") {
+                cfg.key_space = std::stoi(val);
+            } else if (key == "reads_per_tx") {
+                cfg.reads_per_tx = std::stoi(val);
+            } else if (key == "writes_per_tx") {
+                cfg.writes_per_tx = std::stoi(val);
+            } else if (key == "work_us") {
+                cfg.work_us = std::stoi(val);
+            } else {
+                std::cerr << "Unknown option: " << key << std::endl;
+                return 1;
+            }
+        }
+    }
+
+    std::cout << "Running microbenchmark: num_threads=" << cfg.num_threads 
+              << " duration=" << cfg.duration_seconds << "s"
+              << " hot_keys=" << cfg.hot_keys
+              << " key_space=" << cfg.key_space
+              << " reads_per_tx=" << cfg.reads_per_tx
+              << " writes_per_tx=" << cfg.writes_per_tx
+              << " work_us=" << cfg.work_us
+              << std::endl;
+
     if (cfg.hot_keys > 0) {
         double contention_index = 1.0 / static_cast<double>(cfg.hot_keys);
         std::cout << "Contention index (1/H): H=" << cfg.hot_keys << ", CI=" << contention_index << "\n";
