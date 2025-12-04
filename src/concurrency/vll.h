@@ -33,7 +33,8 @@ public:
 					 std::function<void(txn_ptr)> execute,
 					 std::function<txn_ptr()> getNewTxnRequest,
 					 std::function<bool()> shouldStop,
-					 std::size_t maxQueueSize = 1024);
+					 std::size_t maxQueueSize = 1024,
+					 bool enable_sca = true);
 
 private:
 	mutable std::mutex mtx_;

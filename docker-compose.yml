@@ -1,6 +1,12 @@
 version: '3'
 services:
-  vll:
+  vll-bench:
     build: .
-    ports:
-      - "9000:9000"
+    volumes:
+      - ./results:/app/results
+    environment:
+      - NUM_THREADS=5
+      - DURATION=10
+      - WRITES_PER_TX=10
+      - OUTPUT_PREFIX=benchmark
+    command: ["/bin/bash", "/app/scripts/run_benchmark.sh"]

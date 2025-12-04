@@ -12,6 +12,7 @@ add_executable(bench_microbenchmark
     bench/microbenchmark.cpp
     src/core/vll_stman.cpp
     src/concurrency/vll.cpp
+    src/concurrency/sca.cpp
     src/concurrency/lock_manager_2pl.cpp
 )
 

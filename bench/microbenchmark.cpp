@@ -3,6 +3,8 @@
 #include <condition_variable>
 #include <algorithm>
 #include <iostream>
+#include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <random>
 #include <string>
@@ -27,6 +29,10 @@ struct BenchConfig {
     int reads_per_tx = 0;       // Number of reads per transaction
     int writes_per_tx = 10;      // Number of writes per transaction
     int work_us = 160;          // How long in microseconds each transaction "works"
+    bool use_sca = true;        // Enable Selective Contention Analysis (per VLL paper Section 2.5)
+    bool sweep = false;         // Run contention sweep for graphing
+    std::string output_prefix = "benchmark_results";  // Output file prefix for sweep mode
+    bool quiet = false;         // Suppress per-second output
 };
 
 static std::string key_name(int64_t idx) { return "k" + std::to_string(idx); }
@@ -90,15 +96,12 @@ long run_2pl(const BenchConfig& cfg) {
         std::mt19937_64 rng(id + 123);
 
         while (!stop.load()) {
-
             auto sets = gen_tx_sets(cfg, rng);
             auto& reads = sets.reads;
             auto& writes = sets.writes;
 
             lm.acquire_all_atomically(reads, writes);
-
             std::this_thread::sleep_for(std::chrono::microseconds(cfg.work_us));
-
             lm.release_all(reads, writes);
 
             committed.fetch_add(1, std::memory_order_relaxed);
@@ -115,10 +118,12 @@ long run_2pl(const BenchConfig& cfg) {
     std::thread monitor([&]{
         for (int s = 0; s < cfg.duration_seconds && !stop.load(); ++s) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            long total = committed.load();
-            std::cout << "[2PL] elapsed=" << (s+1) << "s, committed=" << total << '\n';
-            for (int i = 0; i < cfg.num_threads; ++i) {
-                std::cout << "  t" << i << ": " << per_thread_committed[i].load() << '\n';
+            if (!cfg.quiet) {
+                long total = committed.load();
+                std::cout << "[2PL] elapsed=" << (s+1) << "s, committed=" << total << '\n';
+                for (int i = 0; i < cfg.num_threads; ++i) {
+                    std::cout << "  t" << i << ": " << per_thread_committed[i].load() << '\n';
+                }
             }
         }
     });
@@ -131,7 +136,7 @@ long run_2pl(const BenchConfig& cfg) {
     std::clock_t cpu_end = std::clock();
     double cpu_seconds = double(cpu_end - cpu_start) / double(CLOCKS_PER_SEC);
     long committed_count = committed.load();
-    if (committed_count > 0) {
+    if (committed_count > 0 && !cfg.quiet) {
         double ns_per_tx = (cpu_seconds / double(committed_count)) * 1e9;
         std::cout << "[2PL] CPU time=" << cpu_seconds << "s, per-tx=" << ns_per_tx << " ns\n";
     }
@@ -158,7 +163,6 @@ long run_vll(const BenchConfig& cfg) {
 
     auto getNew = [&]() -> ConcVLL::txn_ptr {
         std::unique_lock<std::mutex> lk(req_m);
-
         if (std::chrono::steady_clock::now() > wall_end) return nullptr;
         req_cv.wait_for(lk, 50ms, [&]{ return !reqs.empty() || stop.load(); });
         if (reqs.empty()) return nullptr;
@@ -174,25 +178,21 @@ long run_vll(const BenchConfig& cfg) {
     std::vector<std::thread> vll_threads;
     vll_threads.reserve(cfg.num_threads);
     for (int i = 0; i < cfg.num_threads; ++i) {
-        vll_threads.emplace_back([&]{ q.VLLMainLoop(store, exec, getNew, [&]{ return stop.load(); }, 10000); });
+        vll_threads.emplace_back([&]{ q.VLLMainLoop(store, exec, getNew, [&]{ return stop.load(); }, 10000, cfg.use_sca); });
     }
 
     auto worker = [&](int id){
         std::mt19937_64 rng(id + 456);
-
         while (!stop.load()) {
             auto tx = std::make_shared<ConcVLL::Transaction>(0);
-
             auto sets = gen_tx_sets(cfg, rng);
             tx->ReadSet = std::move(sets.reads);
             tx->WriteSet = std::move(sets.writes);
-
             {
                 std::lock_guard<std::mutex> lg(req_m);
                 reqs.push_back(tx);
             }
             req_cv.notify_one();
-
         }
     };
 
@@ -201,11 +201,14 @@ long run_vll(const BenchConfig& cfg) {
 
     std::clock_t cpu_start = std::clock();
 
-    std::thread monitor([&]{
+    const char* vll_label = cfg.use_sca ? "[VLL+SCA]" : "[VLL]";
+    std::thread monitor([&, vll_label]{
         for (int s = 0; s < cfg.duration_seconds && !stop.load(); ++s) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            long total = committed.load();
-            std::cout << "[VLL] elapsed=" << (s+1) << "s, committed=" << total << ", queue=" << q.activeCount() << '\n';
+            if (!cfg.quiet) {
+                long total = committed.load();
+                std::cout << vll_label << " elapsed=" << (s+1) << "s, committed=" << total << ", queue=" << q.activeCount() << '\n';
+            }
         }
     });
 
@@ -228,12 +231,93 @@ long run_vll(const BenchConfig& cfg) {
     std::clock_t cpu_end = std::clock();
     double cpu_seconds = double(cpu_end - cpu_start) / double(CLOCKS_PER_SEC);
     long committed_count = committed.load();
-    if (committed_count > 0) {
+    if (committed_count > 0 && !cfg.quiet) {
         double ns_per_tx = (cpu_seconds / double(committed_count)) * 1e9;
-        std::cout << "[VLL] CPU time=" << cpu_seconds << "s, per-tx=" << ns_per_tx << " ns\n";
+        std::cout << vll_label << " CPU time=" << cpu_seconds << "s, per-tx=" << ns_per_tx << " ns\n";
     }
 
     return committed_count;
+}
+
+void run_sweep(BenchConfig& cfg) {
+    std::vector<int> hot_keys_values = {
+        10000, 5000, 2000, 1000, 500, 200, 100, 50, 20, 10, 5
+    };
+
+    std::string csv_2pl = cfg.output_prefix + "_2pl.csv";
+    std::string csv_vll = cfg.output_prefix + "_vll.csv";
+    std::string csv_vll_sca = cfg.output_prefix + "_vll_sca.csv";
+
+    std::ofstream f_2pl(csv_2pl);
+    std::ofstream f_vll(csv_vll);
+    std::ofstream f_vll_sca(csv_vll_sca);
+
+    f_2pl << "hot_keys,contention_index,throughput_tps,total_txns\n";
+    f_vll << "hot_keys,contention_index,throughput_tps,total_txns\n";
+    f_vll_sca << "hot_keys,contention_index,throughput_tps,total_txns\n";
+
+    cfg.quiet = true;
+
+    int total_runs = hot_keys_values.size() * 3;
+    int current_run = 0;
+
+    std::cout << "\n========================================\n";
+    std::cout << "VLL Benchmark Contention Sweep\n";
+    std::cout << "========================================\n";
+    std::cout << "Threads: " << cfg.num_threads << "\n";
+    std::cout << "Duration per test: " << cfg.duration_seconds << "s\n";
+    std::cout << "Contention levels: " << hot_keys_values.size() << "\n";
+    std::cout << "Total estimated time: ~" << (total_runs * cfg.duration_seconds) / 60 << " minutes\n";
+    std::cout << "========================================\n\n";
+
+    for (int hot_keys : hot_keys_values) {
+        cfg.hot_keys = hot_keys;
+        double ci = 1.0 / static_cast<double>(hot_keys);
+
+        std::cout << std::fixed << std::setprecision(4);
+        std::cout << "[" << ++current_run << "/" << total_runs << "] ";
+        std::cout << "hot_keys=" << hot_keys << " (CI=" << ci << ") - 2PL... " << std::flush;
+
+        long txns = run_2pl(cfg);
+        double tps = static_cast<double>(txns) / cfg.duration_seconds;
+        f_2pl << hot_keys << "," << ci << "," << tps << "," << txns << "\n";
+        std::cout << tps << " tps\n";
+
+        std::cout << "[" << ++current_run << "/" << total_runs << "] ";
+        std::cout << "hot_keys=" << hot_keys << " (CI=" << ci << ") - VLL... " << std::flush;
+
+        cfg.use_sca = false;
+        txns = run_vll(cfg);
+        tps = static_cast<double>(txns) / cfg.duration_seconds;
+        f_vll << hot_keys << "," << ci << "," << tps << "," << txns << "\n";
+        std::cout << tps << " tps\n";
+
+        std::cout << "[" << ++current_run << "/" << total_runs << "] ";
+        std::cout << "hot_keys=" << hot_keys << " (CI=" << ci << ") - VLL+SCA... " << std::flush;
+
+        cfg.use_sca = true;
+        txns = run_vll(cfg);
+        tps = static_cast<double>(txns) / cfg.duration_seconds;
+        f_vll_sca << hot_keys << "," << ci << "," << tps << "," << txns << "\n";
+        std::cout << tps << " tps\n";
+
+        std::cout << "\n";
+    }
+
+    f_2pl.close();
+    f_vll.close();
+    f_vll_sca.close();
+
+    std::cout << "========================================\n";
+    std::cout << "Sweep complete!\n";
+    std::cout << "========================================\n";
+    std::cout << "Output files:\n";
+    std::cout << "  " << csv_2pl << "\n";
+    std::cout << "  " << csv_vll << "\n";
+    std::cout << "  " << csv_vll_sca << "\n";
+
+    std::cout << "\nTo generate plots, run:\n";
+    std::cout << "  python3 scripts/plot_results.py " << cfg.output_prefix << "\n";
 }
 
 int main(int argc, char** argv) {
@@ -264,20 +348,52 @@ int main(int argc, char** argv) {
                 cfg.writes_per_tx = std::stoi(val);
             } else if (key == "work_us") {
                 cfg.work_us = std::stoi(val);
+            } else if (key == "use_sca") {
+                cfg.use_sca = (val == "1" || val == "true" || val == "yes");
+            } else if (key == "sweep") {
+                cfg.sweep = (val.empty() || val == "1" || val == "true" || val == "yes");
+            } else if (key == "output_prefix") {
+                cfg.output_prefix = val;
+            } else if (key == "quiet") {
+                cfg.quiet = (val.empty() || val == "1" || val == "true" || val == "yes");
+            } else if (key == "help") {
+                std::cout << "VLL Microbenchmark\n\n";
+                std::cout << "Usage: " << argv[0] << " [options]\n\n";
+                std::cout << "Options:\n";
+                std::cout << "  --num_threads=N        Number of worker threads (default: 1)\n";
+                std::cout << "  --duration_seconds=N   Duration per benchmark (default: 5)\n";
+                std::cout << "  --hot_keys=N           Number of hot keys (default: 100)\n";
+                std::cout << "  --key_space=N          Total key space size (default: 1000000)\n";
+                std::cout << "  --reads_per_tx=N       Reads per transaction (default: 0)\n";
+                std::cout << "  --writes_per_tx=N      Writes per transaction (default: 10)\n";
+                std::cout << "  --work_us=N            Simulated work microseconds (default: 160)\n";
+                std::cout << "  --use_sca=BOOL         Enable SCA for VLL (default: true)\n";
+                std::cout << "  --sweep                Run contention sweep and generate graphs\n";
+                std::cout << "  --output_prefix=STR    Output file prefix for sweep (default: benchmark_results)\n";
+                std::cout << "  --quiet                Suppress per-second output\n";
+                std::cout << "  --help                 Show this help message\n";
+                return 0;
             } else {
                 std::cerr << "Unknown option: " << key << std::endl;
+                std::cerr << "Use --help for usage information\n";
                 return 1;
             }
         }
     }
 
-    std::cout << "Running microbenchmark: num_threads=" << cfg.num_threads 
+    if (cfg.sweep) {
+        run_sweep(cfg);
+        return 0;
+    }
+    // Single run benchmark
+    std::cout << "Running microbenchmark: num_threads=" << cfg.num_threads
               << " duration=" << cfg.duration_seconds << "s"
               << " hot_keys=" << cfg.hot_keys
               << " key_space=" << cfg.key_space
               << " reads_per_tx=" << cfg.reads_per_tx
               << " writes_per_tx=" << cfg.writes_per_tx
               << " work_us=" << cfg.work_us
+              << " use_sca=" << (cfg.use_sca ? "true" : "false")
               << std::endl;
 
     if (cfg.hot_keys > 0) {
@@ -291,9 +407,9 @@ int main(int argc, char** argv) {
     auto c2 = run_2pl(cfg);
     std::cout << "2PL committed txns: " << c2 << " (" << (c2 / cfg.duration_seconds) << " tps)\n";
 
-    std::cout << "Running VLL...\n";
+    std::cout << "Running VLL" << (cfg.use_sca ? " with SCA" : " without SCA") << "...\n";
     auto cv = run_vll(cfg);
-    std::cout << "VLL committed txns: " << cv << " (" << (cv / cfg.duration_seconds) << " tps)\n";
+    std::cout << "VLL" << (cfg.use_sca ? "+SCA" : "") << " committed txns: " << cv << " (" << (cv / cfg.duration_seconds) << " tps)\n";
 
     return 0;
 }

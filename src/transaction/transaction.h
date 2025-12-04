@@ -27,6 +27,11 @@ struct Transaction {
     std::vector<std::string> ReadSet;
     std::vector<std::string> WriteSet;
 
+    // Hashed keys for SCA
+    std::vector<std::size_t> hashedReadSet;
+    std::vector<std::size_t> hashedWriteSet;
+    bool hashes_cached = false;
+
     enum class Type : uint8_t { Free = 0, Blocked };
 
     Type type = Type::Blocked;

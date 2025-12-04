@@ -6,18 +6,9 @@
 
 This is the simplest way to run the benchmark in a controlled environment.
 
-1.  **Build the Docker image:**
+1.  **Build and Run the Docker image:**
     ```bash
-    docker build -t vll-bench .
-    ```
-
-2.  **Run the benchmark:**
-    ```bash
-    docker run --rm vll-bench
-    ```
-    *To limit resources (as per the paper's methodology):*
-    ```bash
-    docker run --rm --cpus=8 --memory=8g vll-bench
+    NUM_THREADS=5 DURATION=10 docker-compose up --build
     ```
 
 ### Option 2: CMake (Local Build)

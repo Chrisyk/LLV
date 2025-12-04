@@ -1,5 +1,6 @@
 #include "vll.h"
 #include "../transaction/transaction.h"
+#include "sca.h"
 
 #include <algorithm>
 #include <thread>
@@ -139,28 +140,54 @@ void TxnQueue::VLLMainLoop(::storageManager& store,
                            std::function<void(txn_ptr)> execute,
                            std::function<txn_ptr()> getNewTxnRequest,
                            std::function<bool()> shouldStop,
-                           std::size_t maxQueueSize) {
+                           std::size_t maxQueueSize,
+                           bool enable_sca) {
     while (true) {
         txn_ptr toRun = nullptr;
 
         {
             std::lock_guard<std::mutex> lg(mtx_);
-            for (std::size_t i = 0; i < queue_.size(); ++i) {
-                const auto &cand = queue_[i];
-                if (cand->type == Transaction::Type::Blocked) {
-                    if (!conflictsWithOlder(queue_, i)) {
 
-                        cand->type = Transaction::Type::Free;
-                        toRun = cand;
-                        queue_.erase(queue_.begin() + static_cast<std::ptrdiff_t>(i));
-                        break;
+            // Per paper Section 2.5: SCA is activated only when TxnQueue is full
+            // and CPUs would otherwise be idle
+            if (queue_.size() >= maxQueueSize && enable_sca) {
+                // Use SCA to find a blocked transaction that can run
+                toRun = SCA::analyze(queue_);
+                if (toRun) {
+                    auto it = std::find_if(queue_.begin(), queue_.end(),
+                        [&](const txn_ptr& x){ return x->id == toRun->id; });
+                    if (it != queue_.end()) {
+                        (*it)->type = Transaction::Type::Free;
+                        queue_.erase(it);
                     }
+                }
+            } else if (queue_.size() < maxQueueSize) {
+                // Queue not full: use simple conflict checking
+                // Look for blocked transactions that can now run
+                for (std::size_t i = 0; i < queue_.size(); ++i) {
+                    const auto &cand = queue_[i];
+                    if (cand->type == Transaction::Type::Blocked) {
+                        if (!conflictsWithOlder(queue_, i)) {
+                            cand->type = Transaction::Type::Free;
+                            toRun = cand;
+                            queue_.erase(queue_.begin() + static_cast<std::ptrdiff_t>(i));
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // Queue full but SCA disabled: only run front of queue
+                // Per paper: "a blocked transaction that reaches the front of
+                // the TxnQueue will always be able to be unblocked and executed"
+                if (!queue_.empty() && queue_.front()->type == Transaction::Type::Blocked) {
+                    toRun = queue_.front();
+                    toRun->type = Transaction::Type::Free;
+                    queue_.pop_front();
                 }
             }
         }
 
         if (toRun) {
-
             execute(toRun);
             FinishTransaction(toRun, store);
             continue;
@@ -168,10 +195,7 @@ void TxnQueue::VLLMainLoop(::storageManager& store,
 
         {
             std::lock_guard<std::mutex> lg(mtx_);
-            if (queue_.size() < maxQueueSize) {
-
-            } else {
-
+            if (queue_.size() >= maxQueueSize) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
@@ -179,12 +203,10 @@ void TxnQueue::VLLMainLoop(::storageManager& store,
 
         txn_ptr req = getNewTxnRequest();
         if (!req) {
-
             if (shouldStop && shouldStop()) {
                 std::lock_guard<std::mutex> lg(mtx_);
                 if (queue_.empty()) return;
             }
-
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -192,7 +214,6 @@ void TxnQueue::VLLMainLoop(::storageManager& store,
         BeginTransaction(req, store);
 
         if (req->type == Transaction::Type::Free) {
-
             execute(req);
             FinishTransaction(req, store);
         }
